@@ -13,3 +13,6 @@ those to their corresponding nagios alerts.  i.e., if you ack in
 pagerduty, via sms or web ui or phone app, that ack will find it's way
 back to your nagios instance.
 
+set up a cron like so:
+
+  * * * * * nagios /usr/local/bin/pd_ack_to_nagios_ack_poller.pl -p [my_pagerduty_token] -u [my_pagerduty_domain]
