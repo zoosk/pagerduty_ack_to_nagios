@@ -15,4 +15,4 @@ back to your nagios instance.
 
 set up a cron like so:
 
-  * * * * * nagios /usr/local/bin/pd_ack_to_nagios_ack_poller.pl -p [my_pagerduty_token] -u [my_pagerduty_domain]
+    * * * * * nagios /usr/local/bin/pd_ack_to_nagios_ack_poller.pl -p [my_pagerduty_token] -u [my_pagerduty_domain]
