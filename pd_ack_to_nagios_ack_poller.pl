@@ -38,6 +38,7 @@ use Getopt::Long;
 use JSON;
 use Data::Dumper;
 use strict;
+use Storable;
 
 my(%opts);
 my(@opts)=('debug',
@@ -99,11 +100,23 @@ print "$cmd\n" if($opts{debug});
 my(@statcat) = `$cmd`;
 while(@statcat){
   chomp(my(undef, $h, $s, $pi, $a) = (shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat)));
-  next if($a != 0);
+  #next if($a != 0);
   next if($pi == 0);
   $nagstat->{$h}{$s} = $pi;
+  $nagstat->{$h}{'ack'} = $a;
 }
 print Dumper $nagstat if($opts{debug});
+
+my $previous_ack;
+if (-e '/tmp/pd_acked') {
+	print "Found previous file\n";
+	$previous_ack = retrieve '/tmp/pd_acked';
+} else {
+	print "Creating new file\n";
+	$previous_ack = {};
+}
+
+my $new_ack = {};
 for(reverse(@{$i->{incidents}})){
   my($in) = $_->{incident_number};
   my($iid) = $_->{id};
@@ -140,15 +153,72 @@ for(reverse(@{$i->{incidents}})){
       # skip if there's no problem id in nagios (meaning service is
       # already recovered), or if the problem id is more recent than
       # the one in the raw pagerduty entry.
-      if($nagstat->{$h}{$s} && ($nagstat->{$h}{$s} <= $pi)){
+      if($nagstat->{$h}{$s} && ($nagstat->{$h}{$s} <= $pi && $nagstat->{$h}{$a} != 1)){
         my($t) = time;
         #ACKNOWLEDGE_SVC_PROBLEM;<host_name>;<service_description>;<sticky>;<notify>;<persistent>;<author>;<comment>
         $cmd = "echo '[$t] ACKNOWLEDGE_SVC_PROBLEM;$h;$s;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
         print "$cmd\n" if($opts{debug});
         `$cmd`;
+	# save ACKed incident so we can resolve it later (if needed)
+	$new_ack->{$iid} = $in;
       }
     }
     `echo $in >$opts{last_id_file}` unless($opts{last_id});
   }
 }
 
+print Dumper $previous_ack;
+# now loop over the previous ACKed incidents and see if they have been resolved
+foreach my $incident ( keys %$previous_ack ) {
+	# make API call to see if the incident has been resolved
+	$cmd =  "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' ".
+          "'https://$opts{pagerduty_subdomain}.pagerduty.com/api/v1/incidents/$incident/log_entries'";
+	print "$cmd\n" if ($opts{debug});
+	$j = scalar(`$cmd`);
+	my ($ls) = from_json($j, {allow_nonref=>1});
+	print Dumper $ls if ($opts{debug});
+
+	# skip if this is not a nagios alert
+	last unless($ls->{log_entries}[$#{$ls->{log_entries}}]{channel}{type} eq 'nagios');
+	# filter out non-ack/resolve
+        my($lf) = [grep {$_->{type} =~ /^(resolve)/} @{$ls->{log_entries}}];
+	print Dumper $lf if ($opts{debug});
+        # skip if nagios ack/resolution came from nagios (user through nagios gui resolved, so
+	# no need to send command to nagios)
+	last if($lf->[0]{channel}{type} eq 'nagios');
+	# skip if resolution was a timeout
+	last if($lf->[0]{channel}{type} eq 'timeout');
+	my($li) = $ls->{log_entries}[$#{$ls->{log_entries}}]{id};
+      	$cmd = "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' " .
+          "'https://$opts{pagerduty_subdomain}.pagerduty.com/api/v1/log_entries/$li?include%5B%5D=channel'";
+      	print "$cmd\n" if($opts{debug});
+      	$j = scalar(`$cmd`);
+      	my($raw) = from_json($j, {allow_nonref=>1});
+	print Dumper $raw if ($opts{debug});
+	my($h) = $raw->{log_entry}{channel}{details}{HOSTDISPLAYNAME};
+	my($s) = $raw->{log_entry}{channel}{details}{SERVICEDISPLAYNAME};
+	my($pi) = $raw->{log_entry}{channel}{details}{SERVICEPROBLEMID};
+
+	print "Nagstat : " . $nagstat->{$h}{$s} . "\n";
+	print "Pager Duty : " . $pi . "\n";
+	print "Ack number : " . $nagstat->{$h}{'ack'} . "\n";
+	if ($nagstat->{$h}{$s} && ($nagstat->{$h}{$s} <= $pi && $nagstat->{$h}{'ack'} == 1)) {
+		my($t) = time;
+		#REMOVE_SVC_ACKNOWLEDGEMENT;<host_name>;<service_description>
+		$cmd = "echo '[$t] REMOVE_SVC_ACKNOWLEDGEMENT;$h;$s' >$opts{nagios_command_pipe}";
+		print "$cmd\n" if ($opts{debug});
+		`$cmd`;
+		#SCHEDULE_FORCED_SVC_CHECK;<host_name>;<service_description>;<check_time>
+		$cmd = "echo '[$t] SCHEDULE_FORCED_SVC_CHECK;$h;$s;$t' >$opts{nagios_command_pipe}";
+		`$cmd`;
+		# delete this incident from stored hash
+		delete $previous_ack->{$incident};
+	}
+
+}
+print Dumper $previous_ack;
+# combine the previous_ack and new_ack and store 
+my %merged = (%$new_ack, %$previous_ack);
+print Dumper \%merged;
+# update our data store
+store \%merged, '/tmp/pd_acked';
