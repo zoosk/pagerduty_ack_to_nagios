@@ -45,6 +45,7 @@ my(@opts)=('debug',
            'nagios_command_pipe|c=s',
            'pagerduty_token|p=s',
            'pagerduty_subdomain|u=s',
+           'pagerduty_service|n=s',
            'last_id_file=s',
            'last_id=i',
            'help|h',
@@ -63,6 +64,7 @@ options:
  --nagios_command_pipe <_file> | -c <_file> (default /var/spool/nagios/cmd/nagios.cmd)
  --pagerduty_token <_token> | -p <_token>
  --pagerduty_subdomain <_subdomain> | -u <_subdomain>
+ --pagerduty_service <_service> | -n <_service> (limit to a comma separated list of service ids)
  --last_id_file <_file> | -l <_file> (default /tmp/pd_ack_to_nagios_ack_poller.last_id)
  --last_id <_id> (overrides and skips saving to last_id_file)
  --help | -h (this message)
@@ -81,10 +83,16 @@ die "can't access pipe $opts{nagios_command_pipe}" if(!(-w $opts{nagios_command_
 die "--pagerduty_token|-p required" unless($opts{pagerduty_token});
 die "--pagerduty_subdomain|-u required" unless($opts{pagerduty_subdomain});
 
+# optionally specify service id(s)
+my($svcparam) = "";
+if(defined($opts{pagerduty_service})){
+    $svcparam = "&service=$opts{pagerduty_service}";
+}
+
 my($j, $cmd);
 $cmd = "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' " .
     "'https://$opts{pagerduty_subdomain}.pagerduty.com/api/v1/incidents?fields=incident_number,id" .
-    "&status=acknowledged,resolved&sort_by=incident_number:desc'";
+    "${svcparam}&status=acknowledged,resolved&sort_by=incident_number:desc'";
 print "$cmd\n" if($opts{debug});
 $j = scalar(`$cmd`);
 my($i) = from_json($j, {allow_nonref=>1});
