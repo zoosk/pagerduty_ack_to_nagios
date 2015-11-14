@@ -38,6 +38,7 @@ use Getopt::Long;
 use JSON;
 use Data::Dumper;
 use strict;
+use Storable;
 
 my(%opts);
 my(@opts)=('debug',
@@ -76,6 +77,8 @@ $opts{nagios_status_file} ||= '/var/cache/nagios/status.dat';
 $opts{nagios_command_pipe} ||= '/var/spool/nagios/cmd/nagios.cmd';
 $opts{last_id_file} ||= '/tmp/pd_ack_to_nagios_ack_poller.last_id';
 
+my $last_id_file_act = $opts{last_id_file} . ".acked";
+
 die "can't access last_id_file $opts{last_id_file}"
    if(!defined($opts{last_id}) &&
       (-e $opts{last_id_file}) && !(-w $opts{last_id_file}));
@@ -90,6 +93,7 @@ if(defined($opts{pagerduty_service})){
 }
 
 my($j, $cmd);
+# get the latest incidents (limited to 100)
 $cmd = "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' " .
     "'https://$opts{pagerduty_subdomain}.pagerduty.com/api/v1/incidents?fields=incident_number,id" .
     "${svcparam}&status=acknowledged,resolved&sort_by=incident_number:desc'";
@@ -100,23 +104,49 @@ my($last) = $opts{last_id};
 $last ||= (`touch $opts{last_id_file};cat $opts{last_id_file}` + 0);
 
 my($nagstat) = {};
-$cmd = "cat $opts{nagios_status_file} | grep -A50 'servicestatus {'" .
-    "| egrep 'servicestatus|host_name|service_description|current_problem_id|problem_has_been_acknowledged' " .
+#$nagstat->{'service'} = {};
+$cmd = "cat $opts{nagios_status_file} | egrep -A50 'servicestatus|hoststatus {'" .
+    "| egrep 'servicestatus|hoststatus|host_name|service_description|current_problem_id|problem_has_been_acknowledged' " .
     "| cut -d= -f2";
 print "$cmd\n" if($opts{debug});
 my(@statcat) = `$cmd`;
+
+# loop through current incidents
 while(@statcat){
-  chomp(my(undef, $h, $s, $pi, $a) = (shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat)));
-  next if($a != 0);
-  next if($pi == 0);
-  $nagstat->{$h}{$s} = $pi;
+  my $type = shift(@statcat);
+  if ($type =~ /^hoststatus/) {
+    chomp(my($h, $pi, $a) = (shift(@statcat), shift(@statcat), shift(@statcat)));
+    # skip if no incident for host
+    next if ($pi == 0);
+    $nagstat->{$h}{'incident'} = $pi;
+    $nagstat->{$h}{'acknowledged'} = $a;
+    $nagstat->{$h}{'services'} = {};
+  } else {
+    chomp(my($h, $s, $pi, $a) = (shift(@statcat), shift(@statcat), shift(@statcat), shift(@statcat)));
+    # skip if no incident for server
+    next if ($pi == 0);
+    $nagstat->{$h}{'services'}->{$s}{'incident'} = $pi;
+    $nagstat->{$h}{'services'}->{$s}{'acknowledged'} = $a;
+  }
 }
-print Dumper $nagstat if($opts{debug});
+#print Dumper $nagstat if($opts{debug});
+
+my $previous_ack;
+if (-e $last_id_file_act) {
+	print "Found previous file\n";
+	$previous_ack = retrieve $last_id_file_act;
+} else {
+	print "Creating new file\n";
+	$previous_ack = {};
+}
+
+my $new_ack = {};
 for(reverse(@{$i->{incidents}})){
   my($in) = $_->{incident_number};
   my($iid) = $_->{id};
   if($in > $last){
     {
+      print "Shoudl not be in here\n";
       print "$in\n" if($opts{debug});
       $cmd = "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' ".
           "'https://$opts{pagerduty_subdomain}.pagerduty.com/api/v1/incidents/$iid/log_entries'";
@@ -144,19 +174,123 @@ for(reverse(@{$i->{incidents}})){
       print Dumper $raw->{log_entry}{channel}{details} if($opts{debug});
       my($h) = $raw->{log_entry}{channel}{details}{HOSTDISPLAYNAME};
       my($s) = $raw->{log_entry}{channel}{details}{SERVICEDISPLAYNAME};
-      my($pi) = $raw->{log_entry}{channel}{details}{SERVICEPROBLEMID};
-      # skip if there's no problem id in nagios (meaning service is
-      # already recovered), or if the problem id is more recent than
-      # the one in the raw pagerduty entry.
-      if($nagstat->{$h}{$s} && ($nagstat->{$h}{$s} <= $pi)){
-        my($t) = time;
-        #ACKNOWLEDGE_SVC_PROBLEM;<host_name>;<service_description>;<sticky>;<notify>;<persistent>;<author>;<comment>
-        $cmd = "echo '[$t] ACKNOWLEDGE_SVC_PROBLEM;$h;$s;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
-        print "$cmd\n" if($opts{debug});
-        `$cmd`;
+      my ($pd_nagios_object) = $raw->{log_entry}{channel}{details}{pd_nagios_object};
+
+      # determine if this is a host or service problem ID based on the value (or lack thereof) in
+      # SERVICEPROBLEMID or HOSTPROBLEMID
+      my($s_pi) = $raw->{log_entry}{channel}{details}{SERVICEPROBLEMID};
+      my($h_pi) = $raw->{log_entry}{channel}{details}{HOSTPROBLEMID};
+
+      #if ($h_pi == 0) {
+      if ($pd_nagios_object == "service") {
+        # skip if there's no problem id in nagios (meaning service is already recovered), or if the problem id is more recent than
+        # the one in the raw pagerduty entry.
+        if($nagstat->{$h}->{'services'}{$s} && ($nagstat->{$h}->{'services'}{$s}{'incident'} <= $s_pi && $nagstat->{$h}->{'services'}{$s}{'acknowledged'} != 1)){
+          my($t) = time;
+          #ACKNOWLEDGE_SVC_PROBLEM;<host_name>;<service_description>;<sticky>;<notify>;<persistent>;<author>;<comment>
+          $cmd = "echo '[$t] ACKNOWLEDGE_SVC_PROBLEM;$h;$s;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
+          print "$cmd\n" if($opts{debug});
+          `$cmd`;
+	  # save ACKed incident so we can resolve it later (if needed)
+	  $new_ack->{$iid} = $in;
+        }
+      } else {
+        if ($nagstat->{$h}{'incident'} && ($nagstat->{$h}{'incident'} <= $h_pi && $nagstat->{$h}{'acknowledged'} != 1)) {
+          my ($t) = time;
+          #ACKNOWLDEGE_HOST_PROBLEM;<host_name>;<sticky>;<notify>;<persistent>;<author>;<comment>
+          $cmd = "echo '[$t] ACKNOWLEDGE_HOST_PROBLEM;$h;1;0;1;$u;pd event $in $lt by $u via $c' >$opts{nagios_command_pipe}";
+          print "$cmd\n" if ($opts{debug});
+          `$cmd`;
+          # save ACKed incident so we can resolve it later (if needed)
+          $new_ack->{$iid} = $in;
+        }
       }
+ 
     }
     `echo $in >$opts{last_id_file}` unless($opts{last_id});
   }
 }
 
+print Dumper $previous_ack;
+# now loop over the previous ACKed incidents and see if they have been resolved
+foreach my $incident ( keys %$previous_ack ) {
+	# make API call to see if the incident has been resolved
+	$cmd =  "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' ".
+          "'https://$opts{pagerduty_subdomain}.pagerduty.com/api/v1/incidents/$incident/log_entries'";
+	print "$cmd\n" if ($opts{debug});
+	$j = scalar(`$cmd`);
+	my ($ls) = from_json($j, {allow_nonref=>1});
+	print Dumper $ls if ($opts{debug});
+
+	# skip if this is not a nagios alert
+	last unless($ls->{log_entries}[$#{$ls->{log_entries}}]{channel}{type} eq 'nagios');
+	# filter out non-ack/resolve
+        my($lf) = [grep {$_->{type} =~ /^(resolve)/} @{$ls->{log_entries}}];
+	last if scalar @{ $lf } == 0;
+	print Dumper $lf if ($opts{debug});
+        # skip if nagios ack/resolution came from nagios (user through nagios gui resolved, so
+	# no need to send command to nagios)
+	last if($lf->[0]{channel}{type} eq 'nagios');
+	# skip if resolution was a timeout
+	last if($lf->[0]{channel}{type} eq 'timeout');
+	my($li) = $ls->{log_entries}[$#{$ls->{log_entries}}]{id};
+      	$cmd = "curl -s -H 'Authorization: Token token=$opts{pagerduty_token}' " .
+          "'https://$opts{pagerduty_subdomain}.pagerduty.com/api/v1/log_entries/$li?include%5B%5D=channel'";
+      	print "$cmd\n" if($opts{debug});
+      	$j = scalar(`$cmd`);
+      	my($raw) = from_json($j, {allow_nonref=>1});
+	print Dumper $raw if ($opts{debug});
+	my($h) = $raw->{log_entry}{channel}{details}{HOSTDISPLAYNAME};
+	my($s) = $raw->{log_entry}{channel}{details}{SERVICEDISPLAYNAME};
+ 
+        # determine if this is a host or service problem ID based on the value (or lack thereof) in
+	# SERVICEPROBLEMID or HOSTPROBLEMID
+	my($s_pi) = $raw->{log_entry}{channel}{details}{SERVICEPROBLEMID};
+        my($h_pi) = $raw->{log_entry}{channel}{details}{HOSTPROBLEMID};
+	my ($pd_nagios_object) = $raw->{log_entry}{channel}{details}{pd_nagios_object};
+
+	print "S pi = " . $s_pi . "\n";
+        print "H pi = " . $h_pi . "\n";
+        #if ($h_pi == 0) {
+	if ($pd_nagios_object == "service") {
+          print "Service problem\n";
+          print "Host service = " . $nagstat->{$h}->{'services'}{$s} . " incident = " . $nagstat->{$h}->{'services'}{$s}{'incident'} . " ack = " . $nagstat->{$h}->{'services'}{$s}{'acknowledged'} . "\n";
+          if($nagstat->{$h}->{'services'}{$s} && ($nagstat->{$h}->{'services'}{$s}{'incident'} <= $s_pi && $nagstat->{$h}->{'services'}{$s}{'acknowledged'} == 1)) {
+	    my($t) = time;
+	    #REMOVE_SVC_ACKNOWLEDGEMENT;<host_name>;<service_description>
+	    $cmd = "echo '[$t] REMOVE_SVC_ACKNOWLEDGEMENT;$h;$s' >$opts{nagios_command_pipe}";
+	    print "$cmd\n" if ($opts{debug});
+	    `$cmd`;
+	    #SCHEDULE_FORCED_SVC_CHECK;<host_name>;<service_description>;<check_time>
+	    $cmd = "echo '[$t] SCHEDULE_FORCED_SVC_CHECK;$h;$s;$t' >$opts{nagios_command_pipe}";
+            print "$cmd\n" if ($opts{debug});
+	    `$cmd`;
+	    # delete this incident from stored hash
+	    delete $previous_ack->{$incident};
+	  }
+	} else {
+          print "Host problem\n";
+          print "$nagstat->{$h}{'incident'}\n";
+          print "ACK = $nagstat->{$h}{'acknowledged'}\n";
+          if ($nagstat->{$h}{'incident'} && ($nagstat->{$h}{'incident'} <= $h_pi && $nagstat->{$h}{'acknowledged'} == 1)) {
+            print "Got here\n";
+            my ($t) = time;
+            #REMOVE_HOST_ACKNOWLEGEMENT;<hostname>
+            $cmd = "echo '[$t] REMOVE_HOST_ACKNOWLEDGEMENT;$h' >$opts{nagios_command_pipe}";
+            print "$cmd\n" if ($opts{debug});
+            `$cmd`;
+            #SCHEDULED_FORCED_HOST_CHECK;<host_name>;<check_time>
+            $cmd = "echo '[$t] SCHEDULE_HOST_CHECK;$h;$t' >$opts{nagios_command_pipe}";
+            print "$cmd\n" if ($opts{debug});
+            `$cmd`;
+            delete $previous_ack->{$incident};
+          }
+        }
+
+}
+print Dumper $previous_ack;
+# combine the previous_ack and new_ack and store 
+my %merged = (%$new_ack, %$previous_ack);
+print Dumper \%merged;
+# update our data store
+store \%merged, $last_id_file_act;
