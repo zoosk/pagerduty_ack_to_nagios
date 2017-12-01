@@ -46,7 +46,7 @@ my(@opts)=('debug',
            'pagerduty_token|p=s',
            'pagerduty_subdomain|u=s',
            'pagerduty_service|n=s',
-           'last_id_file=s',
+           'last_id_file|l=s',
            'last_id=i',
            'help|h',
     );
