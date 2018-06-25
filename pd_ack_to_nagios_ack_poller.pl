@@ -44,7 +44,6 @@ my(@opts)=('debug',
            'nagios_status_file|s=s',
            'nagios_command_pipe|c=s',
            'pagerduty_token|p=s',
-           'pagerduty_subdomain|u=s',
            'pagerduty_service|n=s',
            'last_id_file|l=s',
            'last_id=i',
@@ -63,7 +62,6 @@ options:
  --nagios_status_file <_file> | -s <_file> (default /var/cache/nagios/status.dat)
  --nagios_command_pipe <_file> | -c <_file> (default /var/spool/nagios/cmd/nagios.cmd)
  --pagerduty_token <_token> | -p <_token>
- --pagerduty_subdomain <_subdomain> | -u <_subdomain>
  --pagerduty_service <_service> | -n <_service> (limit to a comma separated list of service ids)
  --last_id_file <_file> | -l <_file> (default /tmp/pd_ack_to_nagios_ack_poller.last_id)
  --last_id <_id> (overrides and skips saving to last_id_file)
@@ -81,7 +79,6 @@ die "can't access last_id_file $opts{last_id_file}"
       (-e $opts{last_id_file}) && !(-w $opts{last_id_file}));
 die "can't access pipe $opts{nagios_command_pipe}" if(!(-w $opts{nagios_command_pipe}));
 die "--pagerduty_token|-p required" unless($opts{pagerduty_token});
-die "--pagerduty_subdomain|-u required" unless($opts{pagerduty_subdomain});
 
 # optionally specify service id(s)
 my($svcparam) = "";
@@ -224,7 +221,6 @@ for(reverse(@{$i->{incidents}})){
         `$cmd`;
       }
     }
-
     `echo $in >$opts{last_id_file}` unless($opts{last_id});
   }
 }
