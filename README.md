@@ -1,4 +1,4 @@
-THIS PROJECT SEEKING A NEW OWNER!  please open a bug or pull request if you are interested and we will link to your fork here.
+NOTE THIS FORK IS NO LONGER MAINTAINED.  PLEASE REFER TO https://github.com/PagerDuty/pagerduty_ack_to_nagios WHICH IS THE NEW AUTHORITATIVE UPSTREAM
 ===============
 
 pd_ack_to_nagios_ack_poller.pl
